@@ -1,4 +1,4 @@
-FROM lipengcheng/emby-keeper:latest
+FROM lipengchengdocker/emby-keeper:latest
 
 RUN useradd -m -u 1000 embykeeper \
     && chown embykeeper:embykeeper /app -R
