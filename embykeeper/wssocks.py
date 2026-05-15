@@ -1,4 +1,6 @@
 import asyncio
+import hashlib
+import os
 import platform
 import subprocess
 import httpx
@@ -6,9 +8,20 @@ from pathlib import Path
 import stat
 from typing import Optional
 
+from loguru import logger
+
 from .schema import ProxyConfig
 from .utils import get_proxy_str
 from .config import config
+
+
+# 各平台可执行文件的 magic 头, 用于在未提供 SHA-256 时做最低限度的二进制完整性校验
+# 防御场景: HTTPS MITM 替换、GitHub 404 HTML 错误页、截断下载
+_BINARY_MAGIC = {
+    "Linux": (b"\x7fELF",),
+    "Darwin": (b"\xcf\xfa\xed\xfe", b"\xce\xfa\xed\xfe", b"\xca\xfe\xba\xbe", b"\xbe\xba\xfe\xca"),
+    "Windows": (b"MZ",),
+}
 
 
 class WSSocks:
@@ -58,24 +71,40 @@ class WSSocks:
             raise RuntimeError(f"Unsupported platform: {self.system} {self.machine}")
 
     async def download(self) -> None:
-        """Download wssocks binary asynchronously"""
+        """Download wssocks binary asynchronously, with integrity verification."""
 
         url = self.get_download_url()
         temp_path = config.basedir / self.PLATFORM_MAPPING[self.system][self.machine]
 
-        # Download file to temporary path using httpx
         async with httpx.AsyncClient(proxy=self.proxy_str, http2=True, follow_redirects=True) as client:
             response = await client.get(url)
             response.raise_for_status()
+            content = response.content
 
-            # Write response content to file
-            with open(temp_path, "wb") as f:
-                f.write(response.content)
+        # 1) 完整性校验: 若 EK_WSSOCKS_SHA256 已配置, 必须严格匹配
+        expected_sha = os.environ.get("EK_WSSOCKS_SHA256", "").strip().lower()
+        actual_sha = hashlib.sha256(content).hexdigest()
+        if expected_sha:
+            if actual_sha != expected_sha:
+                raise RuntimeError(
+                    f"wssocks 二进制 SHA-256 校验失败: expected={expected_sha} actual={actual_sha}"
+                )
+            logger.debug(f"wssocks 二进制 SHA-256 校验通过: {actual_sha}")
+        else:
+            # 2) 兜底: 至少验证 magic 头, 防止把 HTML 错误页或损坏文件当二进制执行
+            magic_options = _BINARY_MAGIC.get(self.system, ())
+            if magic_options and not any(content.startswith(m) for m in magic_options):
+                raise RuntimeError(
+                    f"下载的 wssocks 不是有效的 {self.system} 可执行文件 (magic 校验失败). "
+                    f"SHA-256={actual_sha}. 可设置 EK_WSSOCKS_SHA256 环境变量做精确校验."
+                )
+            logger.debug(f"wssocks 已下载, SHA-256={actual_sha} (未启用精确校验)")
 
-        # Rename to standard executable name
+        with open(temp_path, "wb") as f:
+            f.write(content)
+
         temp_path.rename(self.executable_path)
 
-        # Set executable permission on Unix
         if self.system != "Windows":
             self.executable_path.chmod(self.executable_path.stat().st_mode | stat.S_IEXEC)
 

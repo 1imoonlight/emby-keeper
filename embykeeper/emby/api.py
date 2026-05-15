@@ -245,7 +245,6 @@ class Emby:
         )
 
     async def _request(self, method: str, path: str, _login=False, **kw) -> Response:
-
         if path.startswith(("http://", "https://")):
             url = path
         else:
@@ -873,7 +872,16 @@ class Emby:
         failed_items = []
         failed_reasons = {"invalid": 0, "no_length": 0, "wrong_type": 0, "short_length": 0}
 
+        # 外层循环硬上限, 防止 played_time 接近但永不达 req_time 时死循环
+        outer_loop_cap = max(len(self.items) * max(config.emby.retries, 1) * 3, 30)
+        outer_loop = 0
         while True:
+            outer_loop += 1
+            if outer_loop > outer_loop_cap:
+                self.log.warning(
+                    f"保活外层循环超过 {outer_loop_cap} 轮上限, 已强制退出, 已播放 {played_time:.0f}/{req_time:.0f} 秒."
+                )
+                return False
             shuffled_items = list(self.items.items())
             random.shuffle(shuffled_items)
 
@@ -957,6 +965,7 @@ class Emby:
                             f"{failed_reasons['short_length']} 个视频时长不足 (未开启 allow_multiple)"
                         )
                     self.log.warning(f"所有视频均不符合要求, 保活失败. 其中: {', '.join(reasons)}")
+                    return False
                 elif played_time > last_played_time:
                     last_played_time = played_time
                     continue

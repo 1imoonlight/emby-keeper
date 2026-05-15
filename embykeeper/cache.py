@@ -1,4 +1,6 @@
 import json
+import os
+import threading
 from typing import Any, List
 
 from loguru import logger
@@ -7,8 +9,17 @@ from .utils import CachedFuncProxy
 from .config import config
 
 
+def _atomic_write_json(path, data) -> None:
+    """原子写入 JSON, 避免崩溃/并发写入导致 cache.json 半写入或损坏。"""
+    tmp = f"{path}.tmp.{os.getpid()}"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False)
+    os.replace(tmp, path)
+
+
 class Cache:
     def __init__(self):
+        self._lock = threading.RLock()
         self._mongo_client = None
         if hasattr(config, "mongodb") and config.mongodb:
             try:
@@ -38,54 +49,55 @@ class Cache:
             result = self._collection.find_one({"_id": key})
             return result["value"] if result else default
         else:
-            value = self._data
-            try:
-                for part in key.split("."):
-                    value = value.get(part, {})
-                return default if value == {} else value
-            except (AttributeError, TypeError):
-                return default
+            with self._lock:
+                value = self._data
+                try:
+                    for part in key.split("."):
+                        value = value.get(part, {})
+                    return default if value == {} else value
+                except (AttributeError, TypeError):
+                    return default
 
     def set(self, key: str, value: Any) -> None:
         if self._mongo_client:
             self._collection.update_one({"_id": key}, {"$set": {"value": value}}, upsert=True)
         else:
-            parts = key.split(".")
-            current = self._data
-            for part in parts[:-1]:
-                current = current.setdefault(part, {})
-            current[parts[-1]] = value
-            with open(self._cache_file, "w", encoding="utf-8") as f:
-                json.dump(self._data, f, ensure_ascii=False)
+            with self._lock:
+                parts = key.split(".")
+                current = self._data
+                for part in parts[:-1]:
+                    current = current.setdefault(part, {})
+                current[parts[-1]] = value
+                _atomic_write_json(self._cache_file, self._data)
 
     def delete(self, key: str) -> None:
         if self._mongo_client:
             self._collection.delete_one({"_id": key})
         else:
-            parts = key.split(".")
-            current = self._data
-            path = []
+            with self._lock:
+                parts = key.split(".")
+                current = self._data
+                path = []
 
-            # 遍历路径, 检查每一层
-            for part in parts[:-1]:
-                if not isinstance(current, dict) or part not in current:
-                    return
-                current = current[part]
-                path.append((part, current))
+                # 遍历路径, 检查每一层
+                for part in parts[:-1]:
+                    if not isinstance(current, dict) or part not in current:
+                        return
+                    current = current[part]
+                    path.append((part, current))
 
-            # 检查并删除最后一个键
-            if isinstance(current, dict) and parts[-1] in current:
-                del current[parts[-1]]
+                # 检查并删除最后一个键
+                if isinstance(current, dict) and parts[-1] in current:
+                    del current[parts[-1]]
 
-                # 清理空字典
-                for part, parent in reversed(path):
-                    if isinstance(parent, dict) and part in parent and not parent[part]:
-                        del parent[part]
-                    else:
-                        break
+                    # 清理空字典
+                    for part, parent in reversed(path):
+                        if isinstance(parent, dict) and part in parent and not parent[part]:
+                            del parent[part]
+                        else:
+                            break
 
-            with open(self._cache_file, "w", encoding="utf-8") as f:
-                json.dump(self._data, f, ensure_ascii=False, indent=2)
+                _atomic_write_json(self._cache_file, self._data)
 
     def find_by_prefix(self, prefix: str) -> List[str]:
         if self._mongo_client:
@@ -122,36 +134,31 @@ class Cache:
         if self._mongo_client:
             self._collection.delete_many({"_id": {"$in": keys}})
         else:
-            # 批量删除所有键, 只写入一次文件
-            changed = False
-            for key in keys:
-                parts = key.split(".")
-                current = self._data
-                path = []
+            with self._lock:
+                changed = False
+                for key in keys:
+                    parts = key.split(".")
+                    current = self._data
+                    path = []
 
-                # 遍历路径, 检查每一层
-                for part in parts[:-1]:
-                    if not isinstance(current, dict) or part not in current:
-                        break
-                    current = current[part]
-                    path.append((part, current))
-
-                # 检查并删除最后一个键
-                if isinstance(current, dict) and parts[-1] in current:
-                    del current[parts[-1]]
-                    changed = True
-
-                    # 清理空字典
-                    for part, parent in reversed(path):
-                        if isinstance(parent, dict) and part in parent and not parent[part]:
-                            del parent[part]
-                        else:
+                    for part in parts[:-1]:
+                        if not isinstance(current, dict) or part not in current:
                             break
+                        current = current[part]
+                        path.append((part, current))
 
-            # 只在有改动时写入一次文件
-            if changed:
-                with open(self._cache_file, "w", encoding="utf-8") as f:
-                    json.dump(self._data, f, ensure_ascii=False, indent=2)
+                    if isinstance(current, dict) and parts[-1] in current:
+                        del current[parts[-1]]
+                        changed = True
+
+                        for part, parent in reversed(path):
+                            if isinstance(parent, dict) and part in parent and not parent[part]:
+                                del parent[part]
+                            else:
+                                break
+
+                if changed:
+                    _atomic_write_json(self._cache_file, self._data)
 
 
 cache: Cache = CachedFuncProxy(lambda: Cache())

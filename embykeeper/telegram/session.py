@@ -460,7 +460,12 @@ class ClientsSession:
 
     async def __aenter__(self):
         await self.test_network()
-        asyncio.create_task(self.test_time())
+        # 保留 task 强引用, 避免被 GC (Python 3.12+ 已知问题)
+        if not hasattr(self.__class__, "_bg_tasks"):
+            self.__class__._bg_tasks = set()
+        _t = asyncio.create_task(self.test_time())
+        self.__class__._bg_tasks.add(_t)
+        _t.add_done_callback(self.__class__._bg_tasks.discard)
         for a in self.accounts:
             try:
                 await self.lock.acquire()

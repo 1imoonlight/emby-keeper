@@ -37,7 +37,12 @@ def get_spec(type: str) -> tuple[str, str]:
 
 @lru_cache
 def get_names(type: str, allow_ignore=False) -> List[str]:
-    """列出服务中所有可用站点."""
+    """列出服务中所有可用站点.
+
+    结果按进程生命周期缓存; 不支持运行时新增/移除站点模块.
+    Docker 部署下镜像不可变, 此缓存策略是安全的.
+    如确需热加载新增的站点适配器, 调用 ``get_names.cache_clear()``.
+    """
     sub, _ = get_spec(type)
     results = []
     typemodule = import_module(f"{__telechecker__}.{sub}")

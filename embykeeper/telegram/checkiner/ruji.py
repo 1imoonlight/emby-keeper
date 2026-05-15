@@ -109,7 +109,7 @@ class RujiCheckin(TemplateACheckin):
                                         detail = json_result.get("detail", "未知错误")
                                         self.log.info(detail)
                                         return await self.finish(RunStatus.ERROR, "签到失败")
-                                except:
+                                except Exception:
                                     self.log.warning(
                                         f"签到失败: 验证码识别后接口返回异常信息:\n{truncate_str(result, 100)}, 可能是您的请求 IP 风控等级较高导致的."
                                     )

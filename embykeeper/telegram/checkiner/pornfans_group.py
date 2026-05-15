@@ -98,7 +98,7 @@ class PornfansGroupCheckin(BotCheckin):
                 finally:
                     try:
                         await msg.delete()
-                    except:
+                    except Exception:
                         pass
         else:
             self.log.warning(f"签到失败: 重试超限.")

@@ -179,8 +179,8 @@ class Link:
                 finally:
                     try:
                         await self.client.remove_handler(handler, group=1)
-                    except:
-                        pass
+                    except Exception as e:
+                        self.log.debug(f"移除 Telegram handler 时出错(忽略): {e}")
 
         finally:
             Link.post_count -= 1

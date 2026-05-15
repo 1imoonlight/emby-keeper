@@ -55,7 +55,7 @@ class WokeMonitor(Monitor):
                     result = resp.text
                     if "完成" in result:
                         return True
-            except:
+            except Exception:
                 return False
 
     async def on_trigger(self, message: Message, key, reply):

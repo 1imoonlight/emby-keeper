@@ -12,6 +12,7 @@ from watchfiles import awatch
 from pydantic import ValidationError
 from appdirs import user_data_dir
 
+from . import var
 from .utils import ProxyBase, deep_update, show_exception
 from .schema import (
     Config,
@@ -101,6 +102,9 @@ class ConfigManager(ProxyBase):
                 for callback in self._callbacks["change"][key]:
                     try:
                         callback(old_val, new_val)
+                    except RuntimeError as e:
+                        # 同步上下文中回调试图 asyncio.create_task() 等
+                        logger.debug(f"配置变更回调因无事件循环跳过: {e}")
                     except Exception as e:
                         logger.warning("根据新配置更新程序状态时出错, 您可能需要重新启动程序.")
                         show_exception(e, regular=False)
@@ -119,6 +123,8 @@ class ConfigManager(ProxyBase):
                     for callback in self._callbacks["list_change"][key]:
                         try:
                             callback(added, deleted)
+                        except RuntimeError as e:
+                            logger.debug(f"配置变更回调因无事件循环跳过: {e}")
                         except Exception as e:
                             logger.warning("根据新配置更新程序状态时出错, 您可能需要重新启动程序.")
                             show_exception(e, regular=False)
@@ -556,8 +562,23 @@ class ConfigManager(ProxyBase):
 
         if self._observer:
             self._observer.cancel()
-            asyncio.gather(self._observer, return_exceptions=True)
+            try:
+                await asyncio.gather(self._observer, return_exceptions=True)
+            except Exception:
+                pass
         self._observer = asyncio.create_task(observer())
+        if self._stop_observer not in var.exit_handlers:
+            var.exit_handlers.append(self._stop_observer)
+
+    async def _stop_observer(self):
+        """供 var.exit_handlers 调用的清理钩子。"""
+        if self._observer and not self._observer.done():
+            self._observer.cancel()
+            try:
+                await asyncio.gather(self._observer, return_exceptions=True)
+            except Exception:
+                pass
+        self._observer = None
 
     @staticmethod
     def load_config_str(data: str):
@@ -582,7 +603,10 @@ class ConfigManager(ProxyBase):
         cfg_dict = {}
         env_config = os.environ.get(f"EK_CONFIG", None)
         if env_config:
-            cfg_dict.update(self.load_config_str(env_config))
+            env_loaded = self.load_config_str(env_config)
+            if env_loaded is None:
+                return False
+            cfg_dict.update(env_loaded)
         else:
             if self.windows:
                 default_conf_file = self.basedir / "config.toml"

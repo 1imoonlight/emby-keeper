@@ -20,8 +20,9 @@ import signal
 import tomlkit
 import typer
 from loguru import logger
+from urllib.parse import urlparse, urljoin
 from flask import Flask, render_template, request, redirect, url_for, jsonify, abort, Blueprint
-from flask_socketio import SocketIO
+from flask_socketio import SocketIO, disconnect
 from flask_login import LoginManager, login_user, login_required, current_user
 from werkzeug.middleware.proxy_fix import ProxyFix
 
@@ -46,7 +47,15 @@ app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_port=1, x_
 app.config["SECRET_KEY"] = os.urandom(24)
 app.config["BASE_PREFIX"] = "/"
 
-socketio = SocketIO(app, cors_allowed_origins="*")
+# CORS 默认仅允许同源；通过 EK_CORS_ORIGINS 环境变量覆盖（逗号分隔）
+_cors_env = os.environ.get("EK_CORS_ORIGINS", "").strip()
+if _cors_env == "*":
+    _cors_origins = "*"
+elif _cors_env:
+    _cors_origins = [o.strip() for o in _cors_env.split(",") if o.strip()]
+else:
+    _cors_origins = []  # 同源
+socketio = SocketIO(app, cors_allowed_origins=_cors_origins)
 login_manager = LoginManager()
 login_manager.init_app(app)
 login_manager.login_view = "main.login"
@@ -58,6 +67,27 @@ app.config["proc"] = None
 app.config["hist"] = ""
 app.config["faillog"] = []
 app.config["config"] = ""
+
+# PTY 历史缓冲上限，避免长跑 OOM；可通过 EK_HIST_MAX_BYTES 覆盖
+HIST_MAX_BYTES = int(os.environ.get("EK_HIST_MAX_BYTES", str(512 * 1024)))
+
+
+def _append_hist(output: str) -> None:
+    """追加 PTY 输出到历史缓冲并截断到上限。"""
+    buf = app.config["hist"] + output
+    if len(buf) > HIST_MAX_BYTES:
+        buf = buf[-HIST_MAX_BYTES:]
+    app.config["hist"] = buf
+
+
+def _is_safe_redirect_target(target: str) -> bool:
+    """仅允许同源相对/绝对路径，阻止开放重定向。"""
+    if not target:
+        return False
+    ref_url = urlparse(request.host_url)
+    test_url = urlparse(urljoin(request.host_url, target))
+    return test_url.scheme in ("http", "https") and ref_url.netloc == test_url.netloc
+
 
 version = f"V{__version__}"
 
@@ -125,7 +155,10 @@ def login_submit():
     else:
         if password == webpass:
             login_user(DummyUser())
-            return redirect(request.args.get("next") or url_for("main.index"))
+            next_target = request.args.get("next")
+            if next_target and _is_safe_redirect_target(next_target):
+                return redirect(next_target)
+            return redirect(url_for("main.index"))
         else:
             emsg = "密码错误, 请重试."
             app.config["faillog"].append(time.time())
@@ -171,11 +204,22 @@ def config_example():
 def config_save():
     if not is_authenticated():
         return "Not authenticated", 401
-    data = request.get_json().get("config")
-    # Parse with tomllib to get clean dict without comments
-    clean_dict = tomllib.loads(data)
-    # Use tomlkit to convert back to TOML string
-    clean_data = tomlkit.dumps(clean_dict)
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict) or "config" not in payload:
+        return jsonify({"error": "Invalid JSON body, expected {'config': '<toml>'}"}), 400
+    data = payload.get("config")
+    if not isinstance(data, str):
+        return jsonify({"error": "config must be a string"}), 400
+    try:
+        clean_dict = tomllib.loads(data)
+    except Exception as e:
+        logger.warning(f"config_save TOML parse error: {e}")
+        return jsonify({"error": f"TOML parse error: {e}"}), 400
+    try:
+        clean_data = tomlkit.dumps(clean_dict)
+    except Exception as e:
+        logger.warning(f"config_save TOML serialize error: {e}")
+        return jsonify({"error": f"TOML serialize error: {e}"}), 400
     encoded_data = base64.b64encode(clean_data.encode()).decode()
     if not app.config["mongodb"]:
         app.config["config"] = encoded_data
@@ -232,6 +276,10 @@ def resize(data):
 
 @socketio.on("connect", namespace="/pty")
 def handle_connect():
+    if not is_authenticated():
+        logger.debug(f"Rejected unauthenticated console connection from {request.sid}")
+        disconnect()
+        return False
     logger.debug(f"Console connected from {request.sid}")
 
 
@@ -256,7 +304,7 @@ def read_and_forward_pty_output():
                         (data, _, _) = select.select([app.config["fd"]], [], [], 1.0)
                         if data:
                             output = os.read(app.config["fd"], max_read_bytes).decode(errors="ignore")
-                            app.config["hist"] += output
+                            _append_hist(output)
                             socketio.emit("pty-output", {"output": output}, namespace="/pty")
                     else:
                         break
@@ -272,7 +320,7 @@ def disconnect_on_proc_exit(proc: Popen):
     if proc == app.config["proc"]:
         logger.debug(f"Command exited with return code {returncode}.")
         output = f"\r\n\n程序已退出, 返回值 {returncode}. " "\r\n请您刷新页面以重新启动程序."
-        app.config["hist"] += output
+        _append_hist(output)
         socketio.emit("pty-output", {"output": output}, namespace="/pty")
 
 
