@@ -10,4 +10,6 @@ services:
     envVars:
       - key: EK_WEBPASS
         sync: false
-    autoDeploy: true
+    # 关闭 autoDeploy: Render 部署由 GitHub Actions 在 base 镜像 push 完成后通过
+    # deploy hook 手动触发, 避免 Render 抢跑拿到旧的 base image.
+    autoDeploy: false

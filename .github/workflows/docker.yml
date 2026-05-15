@@ -18,6 +18,8 @@ concurrency:
 
 jobs:
   build:
+    # 仅在上游仓库运行; fork 不会推送到 embykeeper/embykeeper 命名空间
+    if: github.repository == 'embykeeper/embykeeper'
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
